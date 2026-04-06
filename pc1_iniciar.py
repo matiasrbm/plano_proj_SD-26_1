@@ -5,9 +5,14 @@ Vizinho:  10.62.206.211 (PC2 / Master B)
 
 Fluxo esperado:
   1. Master A sobe na porta 9000 (threshold=3, baixo para saturar rápido)
-  2. Workers A1-A3 se registram
+  2. Workers A1-A3 se registram e conhecem seus peers entre si
   3. Aguarda Master B ficar no ar (PC2 deve ser iniciado em seguida)
   4. Inicia geração de carga a 2 req/s → satura → solicita ajuda ao Master B
+
+Eleição:
+  - Caso Master A fique OFFLINE, workers detectam após 4 falhas de heartbeat
+    e iniciam eleição por consenso (critério: maior espaço livre em disco).
+  - O limite de 4 falhas pode ser ajustado via HEARTBEAT_FALHAS_LIMITE abaixo.
 """
 
 import threading
@@ -17,6 +22,10 @@ from worker import Worker
 
 MEU_IP    = "10.62.206.19"
 IP_COLEGA = "10.62.206.211"
+
+# ── Configuração de eleição ───────────────────────────────────────────────────
+HEARTBEAT_INTERVALO   = 30   # segundos entre cada heartbeat
+HEARTBEAT_FALHAS_LIMITE = 4  # falhas consecutivas antes de iniciar eleição
 
 
 def main():
@@ -30,12 +39,33 @@ def main():
     master_a.iniciar(simular=False)
     time.sleep(1)
 
+    # Portas fixas para que os workers se conheçam como peers de eleição
+    portas_workers = {
+        "A1": 9201,
+        "A2": 9202,
+        "A3": 9203,
+    }
+
     print("Master A no ar. Registrando workers A1, A2, A3...")
     workers = []
-    for i in range(1, 4):
-        w = Worker(f"A{i}", MEU_IP, 9000, meu_ip=MEU_IP, minha_porta=9200 + i)
-        w.iniciar()
+    for wid, porta in portas_workers.items():
+        w = Worker(
+            wid, MEU_IP, 9000,
+            meu_ip=MEU_IP,
+            minha_porta=porta,
+            heartbeat_intervalo=HEARTBEAT_INTERVALO,
+            heartbeat_falhas_limite=HEARTBEAT_FALHAS_LIMITE,
+        )
         workers.append(w)
+
+    # Registra peers cruzados: cada worker conhece os demais
+    for w in workers:
+        for outro in workers:
+            if outro.id != w.id:
+                w.adicionar_peer(MEU_IP, portas_workers[outro.id])
+
+    for w in workers:
+        w.iniciar()
         time.sleep(0.2)
 
     time.sleep(1)
