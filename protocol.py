@@ -13,6 +13,11 @@ REGISTER_TEMP      = "REGISTER_TEMPORARY_WORKER"
 COMMAND_RELEASE    = "COMMAND_RELEASE"
 NOTIFY_RETURNED    = "NOTIFY_WORKER_RETURNED"
 
+# ── Eleição de novo master ────────────────────────────────────────────────────
+ELECTION_START     = "ELECTION_START"   # worker inicia eleição entre os peers
+ELECTION_VOTE      = "ELECTION_VOTE"    # worker envia seu voto (espaço livre em disco)
+ELECTION_RESULT    = "ELECTION_RESULT"  # divulga o master eleito para todos
+
 
 def montar_msg(task, server_id, **extras):
     """Monta um dicionário base com os campos obrigatórios do protocolo."""
@@ -78,6 +83,39 @@ def liberar_worker(sid, wid):
 def avisar_retorno(sid, wid):
     """Worker avisa o master A que voltou."""
     return montar_msg(NOTIFY_RETURNED, sid, WORKER_ID=wid)
+
+
+# ── Eleição de master ─────────────────────────────────────────────────────────
+
+def iniciar_eleicao(sid, disco_livre_bytes, meu_host, minha_porta):
+    """
+    Enviado por um worker para seus peers para iniciar uma rodada de eleição.
+    Inclui o espaço livre em disco do candidato (critério de desempate: maior
+    espaço livre vence).
+    """
+    return montar_msg(ELECTION_START, sid,
+                      DISCO_LIVRE=disco_livre_bytes,
+                      CANDIDATE_HOST=meu_host,
+                      CANDIDATE_PORT=minha_porta)
+
+def votar(sid, disco_livre_bytes, meu_host, minha_porta):
+    """
+    Resposta de um worker a um ELECTION_START — declara seu próprio candidato
+    informando seu espaço livre em disco e onde está escutando como (novo) master.
+    """
+    return montar_msg(ELECTION_VOTE, sid,
+                      DISCO_LIVRE=disco_livre_bytes,
+                      CANDIDATE_HOST=meu_host,
+                      CANDIDATE_PORT=minha_porta)
+
+def resultado_eleicao(sid, novo_master_id, novo_master_host, novo_master_porta):
+    """
+    Broadcast enviado após consenso: anuncia quem é o novo master e onde está.
+    """
+    return montar_msg(ELECTION_RESULT, sid,
+                      NEW_MASTER_ID=novo_master_id,
+                      NEW_MASTER_HOST=novo_master_host,
+                      NEW_MASTER_PORT=novo_master_porta)
 
 
 # ── Transporte ────────────────────────────────────────────────────────────────
