@@ -1,465 +1,410 @@
+#!/usr/bin/env python3
+# ============================================================
+#  worker.py
+#  - Conecta em um Master e RECEBE tarefas
+#  - Descobre Masters por UDP quando nao recebe host/porta
+#  - Elegera o mesmo Master por nome e confirma via TCP
+#  - Processa (simula com sleep) e avisa que terminou
+#  - Pode ser redirecionado para outro Master
+# ============================================================
+#  Como usar:
+#    python worker.py 127.0.0.1 5000
+#    python worker.py
+# ============================================================
+
+import json
 import socket
+import sys
 import threading
 import time
-import random
-import sys
-import shutil
-import logging
+import uuid
 
-import protocol as proto
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [worker %(name)s] %(message)s",
-    datefmt="%H:%M:%S"
+from config import (
+    HEARTBEAT_INTERVAL,
+    HEARTBEAT_TIMEOUT,
+    MASTER_PORT,
+    TASK_DURATION,
+    CONNECTION_ERROR_THRESHOLD,
+    ELECTION_RETRY_INTERVAL,
+    DISCOVERY_PORT,
+    DISCOVERY_TIMEOUT,
+    DISCOVERY_BROADCAST_ADDRESS,
+    DISCOVERY_RETRY_DELAY,
 )
 
-# Número de falhas consecutivas de heartbeat antes de iniciar eleição.
-# Configurável em tempo de criação do worker (padrão = 4).
-HEARTBEAT_FALHAS_LIMITE = 4
+WORKER_UUID = str(uuid.uuid4())
+master_target = {"host": None, "port": None}
+master_target_lock = threading.Lock()
+original_master_target = None
+original_master_uuid = None
+current_master_uuid = None
+last_registration_master_uuid = None
 
 
-class Worker:
-    def __init__(
-        self,
-        wid,
-        master_host,
-        master_porta,
-        meu_ip="0.0.0.0",
-        minha_porta=0,
-        heartbeat_intervalo=30,
-        heartbeat_falhas_limite=HEARTBEAT_FALHAS_LIMITE,
-    ):
-        self.id = wid
-        self.master_host = master_host
-        self.master_porta = master_porta
-        # guarda endereço do master original para poder voltar após empréstimo
-        self.master_original = (master_host, master_porta)
-        self.meu_ip = meu_ip          # IP real reportado aos masters
-        self.rodando = True
-        self.log = logging.getLogger(wid)
-
-        # ── Configuração de heartbeat / eleição ───────────────────────────────
-        self.heartbeat_intervalo     = heartbeat_intervalo
-        self.heartbeat_falhas_limite = heartbeat_falhas_limite
-        self._falhas_heartbeat       = 0   # contador de falhas consecutivas
-        self._eleicao_em_andamento   = False
-        self._eleicao_lock           = threading.Lock()
-
-        # Lista de peers (outros workers) conhecidos: [(host, porta), ...]
-        # Preenchida externamente antes de iniciar, ou via ELECTION_START recebido.
-        self.peers: list = []
-        self._peers_lock = threading.Lock()
-
-        # servidor próprio para receber comandos do master
-        # bind em 0.0.0.0 aceita conexões de qualquer interface
-        self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.server.bind(("0.0.0.0", minha_porta))
-        self.minha_porta = self.server.getsockname()[1]   # porta real se 0 foi passado
-        self.server.listen(5)
-
-    # ── Registro ──────────────────────────────────────────────────────────────
-
-    def registrar(self, host, porta):
-        """Registra-se como worker permanente em (host, porta)."""
-        try:
-            conn = socket.create_connection((host, porta), timeout=5)
-            msg = proto.registrar_worker(self.id, self.id, self.meu_ip, self.minha_porta)
-            proto.enviar(conn, msg)
-            conn.close()
-            self.log.info(f"registrado (normal) em {host}:{porta}")
-        except Exception as e:
-            self.log.error(f"erro ao registrar em {host}:{porta}: {e}")
-
-    def registrar_temporario(self, host, porta, master_orig_host, master_orig_porta):
-        """
-        Registra-se como worker temporário em (host, porta).
-        Informa o endereço do master original para facilitar a devolução.
-        """
-        try:
-            conn = socket.create_connection((host, porta), timeout=5)
-            msg = proto.registrar_temp(
-                self.id, self.id,
-                master_orig_host, master_orig_porta,
-                self.meu_ip, self.minha_porta
-            )
-            proto.enviar(conn, msg)
-            conn.close()
-            self.log.info(f"registrado (temporário) em {host}:{porta}")
-        except Exception as e:
-            self.log.error(f"erro ao registrar temporário em {host}:{porta}: {e}")
-
-    # ── Processamento de tarefas ──────────────────────────────────────────────
-
-    def processar_tarefa(self, tid, duracao=None):
-        if duracao is None:
-            duracao = random.uniform(1, 3)
-        self.log.info(f"processando tarefa {tid} por {duracao:.1f}s...")
-        time.sleep(duracao)
-        self.log.info(f"tarefa {tid} concluída")
-
-    # ── Tratamento de mensagens ───────────────────────────────────────────────
-
-    def tratar_conexao(self, conn, addr):
-        try:
-            msg = proto.receber(conn)
-            if not msg:
-                return
-
-            task = msg.get("TASK")
-
-            if task == proto.HEARTBEAT:
-                # responde ALIVE conforme diagrama de sequência do plano
-                proto.enviar(conn, proto.heartbeat_ok(self.id))
-
-            elif task == proto.TASK_REQUEST:
-                tid = msg.get("TASK_ID", "sem-id")
-                dur = msg.get("DURATION", None)
-                # processa em thread separada para não bloquear o servidor
-                t = threading.Thread(
-                    target=self.processar_tarefa, args=(tid, dur), daemon=True
-                )
-                t.start()
-                proto.enviar(conn, proto.montar_msg(
-                    proto.TASK_RESPONSE, self.id,
-                    TASK_ID=tid, STATUS="ACCEPTED"
-                ))
-
-            elif task == proto.COMMAND_REDIRECT:
-                # master A nos enviou para trabalhar temporariamente no master B
-                novo_host = msg.get("NEW_MASTER_HOST")
-                nova_porta = msg.get("NEW_MASTER_PORT")
-                self.log.info(f"redirecionado para {novo_host}:{nova_porta}")
-
-                orig_host, orig_porta = self.master_original
-                self.master_host = novo_host
-                self.master_porta = nova_porta
-
-                # registra-se no master B como temporário, informando quem é o dono original
-                self.registrar_temporario(
-                    novo_host, nova_porta,
-                    orig_host, orig_porta
-                )
-
-            elif task == proto.COMMAND_RELEASE:
-                # master B nos libera; voltamos para o master A original
-                self.log.info("liberado, voltando ao master original")
-                h, p = self.master_original
-                self.master_host = h
-                self.master_porta = p
-
-                # registra de volta no master A como worker permanente
-                self.registrar(h, p)
-
-                # notifica o master A que voltamos
-                try:
-                    conn2 = socket.create_connection((h, p), timeout=5)
-                    proto.enviar(conn2, proto.avisar_retorno(self.id, self.id))
-                    conn2.close()
-                except Exception as e:
-                    self.log.error(f"erro ao notificar retorno: {e}")
-
-            # ── Mensagens de eleição ──────────────────────────────────────────
-
-            elif task == proto.ELECTION_START:
-                # Um peer iniciou uma eleição. Participamos enviando nosso voto.
-                self._registrar_peer_da_mensagem(msg)
-                disco = self._disco_livre()
-                proto.enviar(conn, proto.votar(
-                    self.id, disco, self.meu_ip, self.minha_porta
-                ))
-                self.log.info(
-                    f"recebi ELECTION_START de {addr} — votei "
-                    f"(disco_livre={disco // (1024**3):.1f} GB)"
-                )
-
-            elif task == proto.ELECTION_RESULT:
-                # O consenso foi alcançado; atualiza master atual.
-                novo_id   = msg.get("NEW_MASTER_ID")
-                novo_host = msg.get("NEW_MASTER_HOST")
-                novo_port = int(msg.get("NEW_MASTER_PORT"))
-                self.log.info(
-                    f"ELEIÇÃO CONCLUÍDA — novo master: {novo_id} "
-                    f"em {novo_host}:{novo_port}"
-                )
-                # Só atualiza se não sou o novo master (ele já gerencia a si mesmo)
-                if novo_id != self.id:
-                    self.master_host  = novo_host
-                    self.master_porta = novo_port
-                    self._falhas_heartbeat = 0
-                    self._eleicao_em_andamento = False
-                    # Re-registra no novo master
-                    threading.Thread(
-                        target=self.registrar,
-                        args=(novo_host, novo_port),
-                        daemon=True
-                    ).start()
-
-        except Exception as e:
-            self.log.error(f"erro ao tratar mensagem de {addr}: {e}")
-        finally:
-            conn.close()
-
-    # ── Loops principais ──────────────────────────────────────────────────────
-
-    def loop_escuta(self):
-        self.log.info(f"escutando na porta {self.minha_porta}")
-        while self.rodando:
-            try:
-                self.server.settimeout(1.0)
-                conn, addr = self.server.accept()
-                t = threading.Thread(
-                    target=self.tratar_conexao, args=(conn, addr), daemon=True
-                )
-                t.start()
-            except socket.timeout:
-                continue
-            except Exception as e:
-                if self.rodando:
-                    self.log.error(f"erro no accept: {e}")
-
-    def loop_heartbeat(self):
-        """
-        Envia heartbeat ao master atual a cada `heartbeat_intervalo` segundos.
-
-        Regra de negócio de eleição:
-        - A cada falha consecutiva, incrementa `_falhas_heartbeat`.
-        - Ao atingir `heartbeat_falhas_limite` (padrão = 4), considera o master
-          como DOWN e dispara o processo de eleição.
-        - O contador é resetado a cada heartbeat bem-sucedido.
-        """
-        while self.rodando:
-            time.sleep(self.heartbeat_intervalo)
-            try:
-                conn = socket.create_connection(
-                    (self.master_host, self.master_porta), timeout=3
-                )
-                proto.enviar(conn, proto.heartbeat(self.id))
-                resp = proto.receber(conn)
-                conn.close()
-
-                if resp and resp.get("RESPONSE") == "ALIVE":
-                    self.log.info("heartbeat: Status ALIVE")
-                    self._falhas_heartbeat = 0   # reseta contador
-                else:
-                    self.log.warning("heartbeat: resposta inesperada")
-                    self._registrar_falha_heartbeat()
-
-            except Exception:
-                self.log.warning(
-                    f"heartbeat: Status OFFLINE "
-                    f"(falha {self._falhas_heartbeat + 1}/{self.heartbeat_falhas_limite})"
-                )
-                self._registrar_falha_heartbeat()
-
-    # ── Eleição ───────────────────────────────────────────────────────────────
-
-    def _registrar_falha_heartbeat(self):
-        """
-        Incrementa o contador de falhas. Ao atingir o limite configurável,
-        inicia eleição (apenas uma vez — protegido por lock).
-        """
-        self._falhas_heartbeat += 1
-        if self._falhas_heartbeat >= self.heartbeat_falhas_limite:
-            with self._eleicao_lock:
-                if not self._eleicao_em_andamento:
-                    self._eleicao_em_andamento = True
-                    self.log.warning(
-                        f"Master OFFLINE confirmado após "
-                        f"{self._falhas_heartbeat} falhas consecutivas — "
-                        "iniciando eleição!"
-                    )
-                    threading.Thread(
-                        target=self._conduzir_eleicao, daemon=True
-                    ).start()
-
-    def _disco_livre(self):
-        """Retorna bytes livres na partição onde o processo está rodando."""
-        return shutil.disk_usage("/").free
-
-    def _registrar_peer_da_mensagem(self, msg):
-        """Aprende endereço de um peer a partir de mensagem de eleição."""
-        host = msg.get("CANDIDATE_HOST")
-        port = msg.get("CANDIDATE_PORT")
-        if host and port:
-            entry = (host, int(port))
-            with self._peers_lock:
-                if entry not in self.peers:
-                    self.peers.append(entry)
-
-    def _conduzir_eleicao(self):
-        """
-        Protocolo de eleição por consenso:
-
-        1. Este worker envia ELECTION_START para todos os peers conhecidos,
-           informando seu próprio espaço livre em disco.
-        2. Coleta as respostas (ELECTION_VOTE) com o espaço livre de cada peer.
-        3. Inclui a si mesmo na contagem.
-        4. O candidato com MAIOR espaço livre em disco é eleito novo master.
-        5. Envia ELECTION_RESULT para todos os peers (broadcast de consenso).
-        6. Se eleito, promove-se a master instanciando um objeto Master local.
-        """
-        self.log.info("=== ELEIÇÃO INICIADA ===")
-        meu_disco = self._disco_livre()
-
-        # Candidatos: {worker_id -> {"disco": bytes, "host": str, "porta": int}}
-        candidatos = {
-            self.id: {
-                "disco": meu_disco,
-                "host":  self.meu_ip,
-                "porta": self.minha_porta,
-            }
-        }
-
-        with self._peers_lock:
-            peers_snapshot = list(self.peers)
-
-        # Coleta votos dos peers
-        for (peer_host, peer_port) in peers_snapshot:
-            try:
-                conn = socket.create_connection((peer_host, peer_port), timeout=5)
-                proto.enviar(conn, proto.iniciar_eleicao(
-                    self.id, meu_disco, self.meu_ip, self.minha_porta
-                ))
-                resp = proto.receber(conn)
-                conn.close()
-
-                if resp and resp.get("TASK") == proto.ELECTION_VOTE:
-                    pid   = resp.get("SERVER_UUID", f"{peer_host}:{peer_port}")
-                    pdisk = resp.get("DISCO_LIVRE", 0)
-                    phost = resp.get("CANDIDATE_HOST", peer_host)
-                    pport = resp.get("CANDIDATE_PORT", peer_port)
-                    candidatos[pid] = {
-                        "disco": pdisk,
-                        "host":  phost,
-                        "porta": int(pport),
-                    }
-                    self.log.info(
-                        f"voto recebido de {pid} — "
-                        f"disco_livre={pdisk // (1024**3):.1f} GB"
-                    )
-            except Exception as e:
-                self.log.warning(f"peer {peer_host}:{peer_port} não respondeu: {e}")
-
-        # Determina vencedor: maior espaço livre em disco
-        eleito_id = max(candidatos, key=lambda wid: candidatos[wid]["disco"])
-        eleito    = candidatos[eleito_id]
-
-        self.log.info(
-            f"=== CONSENSO ALCANÇADO === "
-            f"Novo master: {eleito_id} "
-            f"(disco_livre={eleito['disco'] // (1024**3):.1f} GB) "
-            f"em {eleito['host']}:{eleito['porta']}"
-        )
-
-        # Broadcast do resultado para todos os peers
-        resultado = proto.resultado_eleicao(
-            self.id, eleito_id, eleito["host"], eleito["porta"]
-        )
-        for (peer_host, peer_port) in peers_snapshot:
-            try:
-                conn = socket.create_connection((peer_host, peer_port), timeout=5)
-                proto.enviar(conn, resultado)
-                conn.close()
-            except Exception as e:
-                self.log.warning(f"falha ao notificar {peer_host}:{peer_port}: {e}")
-
-        # Atualiza estado local
-        if eleito_id == self.id:
-            self._promover_a_master(eleito["host"], eleito["porta"])
-        else:
-            self.master_host  = eleito["host"]
-            self.master_porta = int(eleito["porta"])
-            self._falhas_heartbeat     = 0
-            self._eleicao_em_andamento = False
-            # Registra no novo master
-            self.registrar(self.master_host, self.master_porta)
-
-    def _promover_a_master(self, host, porta):
-        """
-        Promove este worker a master: instancia um objeto Master na mesma
-        porta em que o worker está escutando (ou porta configurável), e
-        inicia seus loops. Os demais workers irão se registrar após receberem
-        ELECTION_RESULT.
-        """
-        # Importação local para evitar dependência circular em casos simples
-        from master import Master
-
-        self.log.info(
-            f"!!! SOU O NOVO MASTER — subindo servidor master em {host}:{porta} !!!"
-        )
-
-        novo_master = Master(
-            mid=self.id,
-            host=host,
-            porta=porta,
-        )
-        # Passa os peers conhecidos como vizinhos do novo master
-        with self._peers_lock:
-            for (ph, pp) in self.peers:
-                novo_master.vizinhos.append((ph, pp))
-
-        novo_master.iniciar(simular=False)
-        self._eleicao_em_andamento = False
-
-        self.log.info("Worker promovido a master — loops do master ativos")
-
-    # ── Gerenciamento de peers ────────────────────────────────────────────────
-
-    def adicionar_peer(self, host, porta):
-        """
-        Registra um peer (outro worker) como participante de eleições futuras.
-        Deve ser chamado externamente antes de `iniciar()`, ou pode ser
-        chamado a qualquer momento durante a execução.
-        """
-        entry = (host, int(porta))
-        with self._peers_lock:
-            if entry not in self.peers:
-                self.peers.append(entry)
-                self.log.info(f"peer adicionado: {host}:{porta}")
-
-    # ── Inicialização ─────────────────────────────────────────────────────────
-
-    def iniciar(self):
-        self.registrar(self.master_host, self.master_porta)
-        threading.Thread(target=self.loop_escuta, daemon=True).start()
-        threading.Thread(target=self.loop_heartbeat, daemon=True).start()
-        self.log.info(
-            f"worker pronto "
-            f"(heartbeat a cada {self.heartbeat_intervalo}s, "
-            f"limite={self.heartbeat_falhas_limite} falhas)"
-        )
-
-
-if __name__ == "__main__":
-    if len(sys.argv) < 4:
-        print(
-            "uso: python worker.py <id> <master_host> <master_porta> "
-            "[meu_ip] [minha_porta] [hb_intervalo] [hb_falhas_limite]"
-        )
-        sys.exit(1)
-
-    wid          = sys.argv[1]
-    mhost        = sys.argv[2]
-    mport        = int(sys.argv[3])
-    meu_ip       = sys.argv[4] if len(sys.argv) > 4 else "127.0.0.1"
-    minha_porta  = int(sys.argv[5]) if len(sys.argv) > 5 else 0
-    hb_intervalo = int(sys.argv[6]) if len(sys.argv) > 6 else 30
-    hb_limite    = int(sys.argv[7]) if len(sys.argv) > 7 else HEARTBEAT_FALHAS_LIMITE
-
-    w = Worker(
-        wid, mhost, mport,
-        meu_ip=meu_ip,
-        minha_porta=minha_porta,
-        heartbeat_intervalo=hb_intervalo,
-        heartbeat_falhas_limite=hb_limite,
-    )
-    w.iniciar()
-
+# ── Envio de mensagem JSON ───────────────────────────────────
+def send(sock, payload):
     try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        w.rodando = False
-        print(f"\nworker {wid} encerrado")
+        sock.sendall((json.dumps(payload) + "\n").encode())
+    except OSError:
+        pass
+
+
+# ── Recebimento de mensagem JSON ─────────────────────────────
+def receive(sock):
+    try:
+        data = b""
+        while b"\n" not in data:
+            chunk = sock.recv(4096)
+            if not chunk:
+                return None
+            data += chunk
+        return json.loads(data.split(b"\n")[0])
+    except Exception:
+        return None
+
+
+def receive_with_timeout(sock, timeout_seconds):
+    original_timeout = sock.gettimeout()
+    try:
+        sock.settimeout(timeout_seconds)
+        return receive(sock)
+    except socket.timeout:
+        return None
+    finally:
+        sock.settimeout(original_timeout)
+
+
+# ── Conecta no Master ───────────────────────────────────────
+def connect(host, port):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(HEARTBEAT_TIMEOUT)
+    sock.connect((host, port))
+    print(f"[WORKER] Conectado em {host}:{port}")
+    return sock
+
+
+def build_presentation_payload():
+    current_host, current_port = get_master_target()
+    payload = {
+        # Apresentacao inicial do Worker para o Master.
+        "WORKER": "ALIVE",
+        "WORKER_UUID": WORKER_UUID,
+    }
+
+    borrowed = (
+        original_master_target is not None
+        and original_master_uuid is not None
+        and (current_host, current_port) != original_master_target
+    )
+
+    if borrowed:
+        # Quando o Worker estiver emprestado, informa o Master original.
+        payload["SERVER_UUID"] = original_master_uuid
+
+    return payload
+
+
+def process_task(sock, task_msg):
+    task_id = task_msg.get("TASK_ID", "SEM_ID")
+    user = task_msg.get("USER", "desconhecido")
+    force_nok = bool(task_msg.get("FORCE_NOK", False))
+
+    # Simula o processamento do trabalho recebido do Master.
+    print(f"[WORKER] Processando tarefa {task_id} para {user}...")
+    time.sleep(TASK_DURATION)
+
+    status_payload = {
+        # Reporte de status exigido na Sprint 2.
+        "STATUS": "NOK" if force_nok else "OK",
+        "TASK": "QUERY",
+        "WORKER_UUID": WORKER_UUID,
+        "TASK_ID": task_id,
+    }
+    send(sock, status_payload)
+
+    ack = receive(sock)
+    if ack and ack.get("STATUS") == "ACK":
+        print(f"[WORKER] ACK recebido da tarefa {task_id}.")
+    else:
+        print(f"[WORKER] Sem ACK explicito para a tarefa {task_id}.")
+
+
+def handle_master_message(sock, msg):
+    if not isinstance(msg, dict):
+        return
+
+    if msg.get("TASK") == "QUERY":
+        process_task(sock, msg)
+    elif msg.get("TASK") == "NO_TASK":
+        print("[WORKER] Master informou que nao ha tarefa na fila.")
+    elif msg.get("TASK") == "HEARTBEAT" and msg.get("RESPONSE") == "ALIVE":
+        print("[WORKER] Heartbeat confirmado pelo Master.")
+
+
+def set_master_target(host, port, reason=""):
+    global original_master_target
+    with master_target_lock:
+        master_target["host"] = host
+        master_target["port"] = port
+        if original_master_target is None and host is not None and port is not None:
+            original_master_target = (host, port)
+    if reason and host is not None and port is not None:
+        print(f"[WORKER] Novo master alvo: {host}:{port} ({reason})")
+
+
+def get_master_target():
+    with master_target_lock:
+        return master_target["host"], master_target["port"]
+
+
+def build_discovery_payload():
+    # O worker manda apenas o necessario para a etapa 01.
+    return {
+        "TYPE": "DISCOVERY",
+        "WORKER_UUID": WORKER_UUID,
+    }
+
+
+def valid_discovery_reply(msg):
+    if not isinstance(msg, dict):
+        return False
+    if msg.get("TYPE") != "DISCOVERY_REPLY":
+        return False
+
+    master_name = msg.get("MASTER_NAME")
+    master_ip = msg.get("MASTER_IP")
+    master_port = msg.get("MASTER_PORT")
+    status = msg.get("STATUS")
+
+    if not isinstance(master_name, str) or not master_name.strip():
+        return False
+    if not isinstance(master_ip, str) or not master_ip.strip():
+        return False
+    if status != "AVAILABLE":
+        return False
+    try:
+        int(master_port)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def send_discovery_probes(sock):
+    payload = (json.dumps(build_discovery_payload()) + "\n").encode()
+    targets = [
+        (DISCOVERY_BROADCAST_ADDRESS, DISCOVERY_PORT),
+        ("127.0.0.1", DISCOVERY_PORT),
+    ]
+
+    for target in targets:
+        try:
+            sock.sendto(payload, target)
+            print(f"[WORKER][DISCOVERY] Probe enviado para {target[0]}:{target[1]}.")
+        except OSError as error:
+            print(f"[WORKER][DISCOVERY] Falha ao enviar probe para {target[0]}:{target[1]} - {error}")
+
+
+def collect_discovery_replies():
+    replies = []
+    seen = set()
+    discovery_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    discovery_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    discovery_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    discovery_socket.bind(("", 0))
+    discovery_socket.settimeout(0.5)
+
+    send_discovery_probes(discovery_socket)
+    deadline = time.time() + DISCOVERY_TIMEOUT
+
+    while time.time() < deadline:
+        remaining = deadline - time.time()
+        discovery_socket.settimeout(max(0.05, min(0.5, remaining)))
+        try:
+            data, addr = discovery_socket.recvfrom(4096)
+        except socket.timeout:
+            continue
+        except OSError:
+            break
+
+        try:
+            msg = json.loads(data.decode().strip())
+        except Exception:
+            print(f"[WORKER][DISCOVERY] Resposta invalida recebida de {addr}.")
+            continue
+
+        if not valid_discovery_reply(msg):
+            print(f"[WORKER][DISCOVERY] Resposta descoberta ignorada de {addr}.")
+            continue
+
+        master_name = msg["MASTER_NAME"].strip()
+        master_host = msg["MASTER_IP"].strip()
+        master_port = int(msg["MASTER_PORT"])
+        key = (master_name, master_host, master_port)
+        if key in seen:
+            continue
+        seen.add(key)
+        replies.append({"name": master_name, "host": master_host, "port": master_port})
+        print(f"[WORKER][DISCOVERY] Resposta valida de {master_name} em {master_host}:{master_port}.")
+
+    discovery_socket.close()
+    return replies
+
+
+def choose_discovery_winner(replies):
+    if not replies:
+        return None
+    return min(replies, key=lambda item: (item["name"], item["host"], item["port"]))
+
+
+def discover_master():
+    replies = collect_discovery_replies()
+    if not replies:
+        print("[WORKER][DISCOVERY] Nenhum Master respondeu dentro da janela de descoberta.")
+        return None
+
+    winner = choose_discovery_winner(replies)
+    print(
+        f"[WORKER][ELECTION] Vencedor escolhido por nome: {winner['name']} "
+        f"({winner['host']}:{winner['port']})."
+    )
+    return winner
+
+
+def perform_election_handshake(sock, selected_master_name):
+    # Esta eh a ponte entre a eleicao e o fluxo de heartbeat ja existente.
+    payload = {
+        "TYPE": "ELECTION_ACK",
+        "WORKER_UUID": WORKER_UUID,
+        "SELECTED_MASTER": selected_master_name,
+    }
+    send(sock, payload)
+    response = receive(sock)
+
+    if (
+        response
+        and response.get("TYPE") == "ELECTION_ACK"
+        and response.get("STATUS") == "ACCEPTED"
+        and response.get("MASTER_NAME") == selected_master_name
+    ):
+        print(f"[WORKER][ELECTION] ACK confirmado por {selected_master_name}.")
+        return True
+
+    print(f"[WORKER][ELECTION] ACK negado ou ausente para {selected_master_name}.")
+    return False
+
+
+def register_with_master(sock):
+    global original_master_uuid, current_master_uuid, last_registration_master_uuid
+
+    payload = build_presentation_payload()
+    send(sock, payload)
+
+    response = receive(sock)
+    if not response:
+        return None
+
+    response_server_uuid = response.get("SERVER_UUID")
+    if isinstance(response_server_uuid, str) and response_server_uuid.strip():
+        current_master_uuid = response_server_uuid
+        if original_master_uuid is None:
+            original_master_uuid = response_server_uuid
+
+    print(f"[WORKER] Apresentacao enviada: {payload}")
+
+    if response.get("TASK") == "QUERY":
+        process_task(sock, response)
+    elif response.get("TASK") == "NO_TASK":
+        print("[WORKER] Master informou que nao havia tarefa na apresentacao.")
+
+    last_registration_master_uuid = current_master_uuid
+    return response
+
+
+# ── Loop principal: heartbeat periodico com reconexao ────────
+def run(host=None, port=None):
+    global original_master_uuid, current_master_uuid, last_registration_master_uuid
+
+    discovery_mode = host is None or port is None
+    if discovery_mode:
+        print("[WORKER][DISCOVERY] Iniciando sem host/porta configurados; usando descoberta UDP.")
+    else:
+        set_master_target(host, port, "inicial")
+
+    sock = None
+    consecutive_errors = 0
+    selected_master = None
+
+    while True:
+        try:
+            if discovery_mode and sock is None:
+                selected_master = discover_master()
+                if selected_master is None:
+                    consecutive_errors += 1
+                    print(
+                        f"[WORKER] Status: OFFLINE - Nenhum Master encontrado "
+                        f"({consecutive_errors}/{CONNECTION_ERROR_THRESHOLD})"
+                    )
+                    time.sleep(DISCOVERY_RETRY_DELAY)
+                    continue
+                set_master_target(
+                    selected_master["host"],
+                    selected_master["port"],
+                    f"descoberta {selected_master['name']}",
+                )
+
+            target_host, target_port = get_master_target()
+            if target_host is None or target_port is None:
+                raise TimeoutError("Master alvo nao definido")
+
+            if sock is None:
+                sock = connect(target_host, target_port)
+                if discovery_mode:
+                    if not perform_election_handshake(sock, selected_master["name"]):
+                        raise TimeoutError("Handshake de eleicao recusado")
+
+            response = register_with_master(sock)
+            if response is None:
+                raise TimeoutError("Resposta invalida ou ausente do Master na solicitacao")
+
+            consecutive_errors = 0
+            time.sleep(HEARTBEAT_INTERVAL)
+
+        except (socket.timeout, TimeoutError, OSError):
+            consecutive_errors += 1
+            print(
+                f"[WORKER] Status: OFFLINE - Tentando Reconectar "
+                f"({consecutive_errors}/{CONNECTION_ERROR_THRESHOLD})"
+            )
+            try:
+                if sock is not None:
+                    sock.close()
+            except OSError:
+                pass
+            sock = None
+            last_registration_master_uuid = None
+
+            if discovery_mode:
+                selected_master = None
+                time.sleep(DISCOVERY_RETRY_DELAY)
+                continue
+
+            time.sleep(ELECTION_RETRY_INTERVAL)
+
+
+# ── Entry point ──────────────────────────────────────────────
+if __name__ == "__main__":
+    if len(sys.argv) == 1:
+        print(f"[WORKER] UUID: {WORKER_UUID}")
+        run()
+    elif len(sys.argv) == 3:
+        host = sys.argv[1]
+        port = int(sys.argv[2])
+
+        print(f"[WORKER] UUID: {WORKER_UUID}")
+        run(host, port)
+    else:
+        print("Uso: python worker.py [<host> <porta>]")
+        print("Exemplos:")
+        print("  python worker.py")
+        print("  python worker.py 127.0.0.1 5000")
+        sys.exit(1)
