@@ -37,8 +37,10 @@ master_target = {"host": None, "port": None}
 master_target_lock = threading.Lock()
 original_master_target = None
 original_master_uuid = None
+original_master_name = None
 current_master_uuid = None
 last_registration_master_uuid = None
+pending_temporary_registration = False
 
 
 # ── Envio de mensagem JSON ───────────────────────────────────
@@ -74,6 +76,29 @@ def receive_with_timeout(sock, timeout_seconds):
         sock.settimeout(original_timeout)
 
 
+def protocol_message_type(msg):
+    if not isinstance(msg, dict):
+        return None
+    return msg.get("type") or msg.get("TYPE") or msg.get("TASK")
+
+
+def protocol_payload(msg):
+    if not isinstance(msg, dict):
+        return {}
+    payload = msg.get("payload")
+    if isinstance(payload, dict):
+        return payload
+    return msg
+
+
+def build_protocol_message(message_type, payload):
+    return {
+        "type": message_type,
+        "request_id": str(uuid.uuid4()),
+        "payload": payload,
+    }
+
+
 # ── Conecta no Master ───────────────────────────────────────
 def connect(host, port):
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -104,6 +129,73 @@ def build_presentation_payload():
     return payload
 
 
+def build_temporary_registration_message():
+    current_host, current_port = get_master_target()
+    original_host, original_port = (None, None)
+    if original_master_target is not None:
+        original_host, original_port = original_master_target
+
+    payload = {
+        "WORKER_UUID": WORKER_UUID,
+        "ORIGINAL_MASTER_UUID": original_master_uuid,
+        "ORIGINAL_MASTER_NAME": original_master_name,
+        "ORIGINAL_MASTER_HOST": original_host,
+        "ORIGINAL_MASTER_PORT": original_port,
+        "CURRENT_MASTER_HOST": current_host,
+        "CURRENT_MASTER_PORT": current_port,
+        "SERVER_UUID": original_master_uuid,
+    }
+    return build_protocol_message("register_temporary_worker", payload)
+
+
+def build_registration_message():
+    if pending_temporary_registration:
+        return build_temporary_registration_message()
+    return build_presentation_payload()
+
+
+def handle_control_message(msg):
+    global pending_temporary_registration, current_master_uuid, original_master_name
+
+    message_type = protocol_message_type(msg)
+    payload = protocol_payload(msg)
+
+    if message_type == "command_redirect":
+        new_host = payload.get("new_master_host") or msg.get("NEW_MASTER_HOST")
+        new_port = payload.get("new_master_port") or msg.get("NEW_MASTER_PORT")
+        new_master_name = payload.get("new_master_name") or msg.get("NEW_MASTER_NAME")
+        if new_host is not None and new_port is not None:
+            # Preserva o nome do master original para incluir no register_temporary_worker.
+            orig_name = payload.get("original_master_name") or msg.get("ORIGINAL_MASTER_NAME")
+            if orig_name is not None and original_master_name is None:
+                original_master_name = orig_name
+            set_master_target(new_host, int(new_port), f"redirecionado para {new_master_name or 'novo master'}")
+            pending_temporary_registration = True
+            print(
+                f"[WORKER] Redirecionado para {new_master_name or new_host}:{new_port}. "
+                "Reconectando..."
+            )
+            return "reconnect"
+
+    if message_type == "command_release":
+        return_host = payload.get("return_to_master_host") or msg.get("RETURN_TO_MASTER_HOST")
+        return_port = payload.get("return_to_master_port") or msg.get("RETURN_TO_MASTER_PORT")
+        return_master_name = payload.get("return_to_master_name") or msg.get("RETURN_TO_MASTER_NAME")
+        if return_host is not None and return_port is not None:
+            set_master_target(return_host, int(return_port), f"retorno para {return_master_name or 'master original'}")
+            pending_temporary_registration = False
+            print(
+                f"[WORKER] Liberado pelo Master atual. Retornando para {return_master_name or return_host}:{return_port}."
+            )
+            return "reconnect"
+
+    if message_type == "register_temporary_worker":
+        print("[WORKER] Registro temporario confirmado pelo Master.")
+        return None
+
+    return None
+
+
 def process_task(sock, task_msg):
     task_id = task_msg.get("TASK_ID", "SEM_ID")
     user = task_msg.get("USER", "desconhecido")
@@ -122,23 +214,44 @@ def process_task(sock, task_msg):
     }
     send(sock, status_payload)
 
-    ack = receive(sock)
-    if ack and ack.get("STATUS") == "ACK":
-        print(f"[WORKER] ACK recebido da tarefa {task_id}.")
-    else:
-        print(f"[WORKER] Sem ACK explicito para a tarefa {task_id}.")
+    deadline = time.time() + HEARTBEAT_TIMEOUT
+    while time.time() < deadline:
+        remaining = max(0.05, min(0.5, deadline - time.time()))
+        response = receive_with_timeout(sock, remaining)
+        if response is None:
+            continue
+
+        action = handle_master_message(sock, response)
+        if action == "reconnect":
+            return "reconnect"
+
+        if response.get("STATUS") == "ACK":
+            print(f"[WORKER] ACK recebido da tarefa {task_id}.")
+            return None
+
+    print(f"[WORKER] Sem ACK explicito para a tarefa {task_id}.")
+    return None
 
 
 def handle_master_message(sock, msg):
     if not isinstance(msg, dict):
         return
 
+    action = handle_control_message(msg)
+    if action is not None:
+        return action
+
     if msg.get("TASK") == "QUERY":
-        process_task(sock, msg)
+        return process_task(sock, msg)
     elif msg.get("TASK") == "NO_TASK":
         print("[WORKER] Master informou que nao ha tarefa na fila.")
     elif msg.get("TASK") == "HEARTBEAT" and msg.get("RESPONSE") == "ALIVE":
         print("[WORKER] Heartbeat confirmado pelo Master.")
+
+    if msg.get("STATUS") == "ACK":
+        print("[WORKER] ACK confirmado pelo Master.")
+
+    return None
 
 
 def set_master_target(host, port, reason=""):
@@ -294,14 +407,18 @@ def perform_election_handshake(sock, selected_master_name):
 
 
 def register_with_master(sock):
-    global original_master_uuid, current_master_uuid, last_registration_master_uuid
+    global original_master_uuid, current_master_uuid, last_registration_master_uuid, pending_temporary_registration
 
-    payload = build_presentation_payload()
+    temporary_registration = pending_temporary_registration
+    payload = build_registration_message()
     send(sock, payload)
 
-    response = receive(sock)
+    response = receive_with_timeout(sock, HEARTBEAT_TIMEOUT)
     if not response:
-        return None
+        raise TimeoutError("Resposta invalida ou ausente do Master na solicitacao")
+
+    if protocol_message_type(response) == "register_temporary_worker":
+        return handle_master_message(sock, response)
 
     response_server_uuid = response.get("SERVER_UUID")
     if isinstance(response_server_uuid, str) and response_server_uuid.strip():
@@ -311,18 +428,20 @@ def register_with_master(sock):
 
     print(f"[WORKER] Apresentacao enviada: {payload}")
 
-    if response.get("TASK") == "QUERY":
-        process_task(sock, response)
-    elif response.get("TASK") == "NO_TASK":
-        print("[WORKER] Master informou que nao havia tarefa na apresentacao.")
+    action = handle_master_message(sock, response)
+    if action == "reconnect":
+        return "reconnect"
+
+    if temporary_registration:
+        pending_temporary_registration = False
 
     last_registration_master_uuid = current_master_uuid
-    return response
+    return "ok"
 
 
 # ── Loop principal: heartbeat periodico com reconexao ────────
 def run(host=None, port=None):
-    global original_master_uuid, current_master_uuid, last_registration_master_uuid
+    global original_master_uuid, current_master_uuid, last_registration_master_uuid, original_master_name
 
     discovery_mode = host is None or port is None
     if discovery_mode:
@@ -361,13 +480,48 @@ def run(host=None, port=None):
                 if discovery_mode:
                     if not perform_election_handshake(sock, selected_master["name"]):
                         raise TimeoutError("Handshake de eleicao recusado")
+                    # Registra o nome do master eleito para uso em register_temporary_worker.
+                    if original_master_name is None:
+                        original_master_name = selected_master["name"]
 
-            response = register_with_master(sock)
-            if response is None:
+            action = register_with_master(sock)
+            if action == "reconnect":
+                try:
+                    if sock is not None:
+                        sock.close()
+                except OSError:
+                    pass
+                sock = None
+                consecutive_errors = 0
+                continue
+
+            if action == "ok":
+                wait_deadline = time.time() + HEARTBEAT_INTERVAL
+                while time.time() < wait_deadline:
+                    remaining = max(0.05, min(0.5, wait_deadline - time.time()))
+                    msg = receive_with_timeout(sock, remaining)
+                    if msg is None:
+                        continue
+
+                    action = handle_master_message(sock, msg)
+                    if action == "reconnect":
+                        break
+
+                if action == "reconnect":
+                    try:
+                        if sock is not None:
+                            sock.close()
+                    except OSError:
+                        pass
+                    sock = None
+                    consecutive_errors = 0
+                    continue
+
+            if sock is None:
                 raise TimeoutError("Resposta invalida ou ausente do Master na solicitacao")
 
             consecutive_errors = 0
-            time.sleep(HEARTBEAT_INTERVAL)
+            time.sleep(0.01)
 
         except (socket.timeout, TimeoutError, OSError):
             consecutive_errors += 1
